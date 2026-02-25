@@ -44,3 +44,8 @@ python source.py -i "https://drive.google.com/file/d/.../view"
 4. Saves session cookies to `cookies.txt`.
 5. Downloads streams in parallel chunks.
 6. Merges using FFmpeg.
+
+Disclaimer
+This project is provided "as is" without warranty of any kind, either expressed or implied, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose. The entire risk as to the quality and performance of the project is with you. Should the project prove defective, you assume the cost of all necessary servicing, repair, or correction.
+In no event shall the author be liable for any damages whatsoever (including, without limitation, damages for loss of business profits, business interruption, loss of business information, or other pecuniary loss) arising out of the use of or inability to use this project, even if the author has been advised of the possibility of such damages.
+The author is not responsible for any misuse, illegal activities, or consequences resulting from the use of this project. Users are solely responsible for ensuring their use complies with applicable laws and regulations.

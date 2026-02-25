@@ -18,7 +18,7 @@ A modular Python tool to capture and download high-quality video and audio strea
 1. **Python 3.7+**
 2. **Playwright**: For browser automation.
    ```bash
-   pip install playwright
+   pip install playwright tqdm
    playwright install chromium
    ```
 3. **FFmpeg**: Required for merging video and audio. Ensure it's in your system PATH.

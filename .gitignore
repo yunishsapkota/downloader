@@ -1,4 +1,9 @@
 # Byte-compiled / optimized / DLL files
+.tmp/
+downloads/
+.tmp
+downloads
+
 *.mp4
 *cookie*
 __pycache__/

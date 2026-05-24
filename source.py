@@ -5,7 +5,7 @@ import time
 import shutil
 import argparse
 import threading
-from typing import List, Optional, Set
+from typing import List, Optional, Set, TypedDict
 
 DEFAULT_CAPTURE_WAIT = 8
 POST_LOAD_DELAY = 1
@@ -26,6 +26,11 @@ DRIVE_FILE_RE = re.compile(
 DRIVE_OPEN_RE = re.compile(
     r"drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)", re.IGNORECASE
 )
+
+
+class DriveItem(TypedDict):
+    url: str
+    title: str
 
 
 def strip_range_param(url: str) -> str:
@@ -85,47 +90,110 @@ def normalize_drive_url(url: str) -> Optional[str]:
     return None
 
 
-def extract_drive_links(page) -> List[str]:
-    """Collect unique Google Drive file links from the current page."""
-    raw_links = page.evaluate(
+def extract_drive_items(page) -> List[DriveItem]:
+    """Collect Drive links with topic/file titles from the current page."""
+    raw_items = page.evaluate(
         """() => {
-            const found = new Set();
-            const add = (href) => {
-                if (!href) return;
+            const GENERIC = new Set([
+                "open", "view", "download", "drive", "google drive", "more", "file",
+            ]);
+            const isGeneric = (text) => {
+                const t = (text || "").trim().toLowerCase();
+                return !t || GENERIC.has(t) || t.length < 2;
+            };
+
+            const toUrl = (href) => {
+                if (!href) return null;
                 const file = href.match(/drive\\.google\\.com\\/file\\/d\\/([a-zA-Z0-9_-]+)/i);
-                if (file) {
-                    found.add(`https://drive.google.com/file/d/${file[1]}/view`);
-                    return;
-                }
+                if (file) return `https://drive.google.com/file/d/${file[1]}/view`;
                 const open = href.match(/drive\\.google\\.com\\/open\\?id=([a-zA-Z0-9_-]+)/i);
-                if (open) {
-                    found.add(`https://drive.google.com/file/d/${open[1]}/view`);
+                if (open) return `https://drive.google.com/file/d/${open[1]}/view`;
+                return null;
+            };
+
+            const findTopicTitle = (node) => {
+                let el = node;
+                for (let i = 0; i < 15 && el; i++) {
+                    const heading = el.querySelector('[role="heading"], h1, h2, h3, h4');
+                    if (heading) {
+                        const t = (heading.innerText || heading.textContent || "")
+                            .trim()
+                            .replace(/\\s+/g, " ");
+                        if (!isGeneric(t)) return t;
+                    }
+                    el = el.parentElement;
+                }
+                return "";
+            };
+
+            const pickTitle = (linkTitle, topicTitle) => {
+                const link = isGeneric(linkTitle) ? "" : linkTitle.trim();
+                const topic = isGeneric(topicTitle) ? "" : topicTitle.trim();
+                if (topic && link && link !== topic) return `${topic} — ${link}`;
+                if (topic) return topic;
+                if (link) return link;
+                return "";
+            };
+
+            const found = new Map();
+
+            const register = (href, linkTitle, topicTitle) => {
+                const url = toUrl(href);
+                if (!url) return;
+                const title = pickTitle(linkTitle, topicTitle);
+                const prev = found.get(url) || "";
+                if (!prev || (title && title.length > prev.length)) {
+                    found.set(url, title);
                 }
             };
-            document.querySelectorAll("a[href]").forEach((a) => add(a.href));
-            document.querySelectorAll("iframe[src]").forEach((el) => add(el.src));
+
+            document.querySelectorAll("a[href]").forEach((anchor) => {
+                const href = anchor.href;
+                if (!/drive\\.google\\.com/i.test(href)) return;
+                const linkTitle = (
+                    anchor.innerText ||
+                    anchor.textContent ||
+                    anchor.getAttribute("aria-label") ||
+                    ""
+                )
+                    .trim()
+                    .replace(/\\s+/g, " ");
+                register(href, linkTitle, findTopicTitle(anchor));
+            });
+
+            document.querySelectorAll("iframe[src]").forEach((frame) => {
+                register(frame.src, "", "");
+            });
+
             const html = document.documentElement.innerHTML;
             for (const re of [
                 /drive\\.google\\.com\\/file\\/d\\/([a-zA-Z0-9_-]+)/gi,
                 /drive\\.google\\.com\\/open\\?id=([a-zA-Z0-9_-]+)/gi,
             ]) {
-                let m;
-                while ((m = re.exec(html)) !== null) {
-                    found.add(`https://drive.google.com/file/d/${m[1]}/view`);
+                let match;
+                while ((match = re.exec(html)) !== null) {
+                    const url = `https://drive.google.com/file/d/${match[1]}/view`;
+                    if (!found.has(url)) found.set(url, "");
                 }
             }
-            return [...found];
+
+            return Array.from(found.entries()).map(([url, title]) => ({ url, title }));
         }"""
     )
 
     seen = set()
-    ordered = []
-    for link in raw_links:
-        normalized = normalize_drive_url(link)
-        if normalized and normalized not in seen:
-            seen.add(normalized)
-            ordered.append(normalized)
-    return ordered
+    items: List[DriveItem] = []
+    for entry in raw_items:
+        normalized = normalize_drive_url(entry["url"])
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append({"url": normalized, "title": (entry.get("title") or "").strip()})
+    return items
+
+
+def display_name_for_item(item: DriveItem) -> str:
+    return item["title"] or item["url"]
 
 
 def save_cookies(context, cookie_file: str) -> None:
@@ -234,9 +302,11 @@ def wait_for_streams(seconds: int) -> None:
     time.sleep(seconds)
 
 
-def prompt_skip_file(cooldown: int = FILE_SKIP_COOLDOWN) -> bool:
+def prompt_skip_file(cooldown: int = FILE_SKIP_COOLDOWN, title: Optional[str] = None) -> bool:
     """Wait up to cooldown seconds; Enter skips this file entirely."""
-    print(f"\nPress Enter to skip this file ({cooldown}s)...", flush=True)
+    if title:
+        print(f"\nNext: {title}")
+    print(f"Press Enter to skip this file ({cooldown}s)...", flush=True)
     skipped = {"value": False}
 
     def _read_enter():
@@ -384,23 +454,34 @@ def download_captured_streams(
     return False
 
 
-def process_single_video(page, context, url: str, args, cookie_file: str, index=None, total=None):
+def process_single_video(
+    page,
+    context,
+    url: str,
+    args,
+    cookie_file: str,
+    index=None,
+    total=None,
+    title: Optional[str] = None,
+):
     """Returns True on success, False on failure, None if skipped."""
     label = ""
     if index is not None and total is not None:
         label = f"[{index}/{total}] "
 
+    display = (title or "").strip() or url
+
     print(f"\n{'=' * 60}")
-    print(f"{label}Next: {url}")
+    print(f"{label}{display}")
     print(f"{'=' * 60}")
 
-    if prompt_skip_file(args.skip_cooldown):
+    if prompt_skip_file(args.skip_cooldown, title=display):
         return None
 
     captured_urls = set()
     attach_capture_handler(page, captured_urls)
 
-    print(f"{label}Opening: {url}")
+    print(f"{label}Opening: {display}")
     page.goto(url)
 
     start_video_playback(page, args.wait)
@@ -421,15 +502,18 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
     print("\nClassroom page is open — sign in and scroll if needed.")
     wait_for_streams(args.wait)
 
-    drive_links = extract_drive_links(page)
-    if not drive_links:
+    drive_items = extract_drive_items(page)
+    if not drive_items:
         print("\nNo Google Drive links found on this page.")
         print("Make sure attachments are visible, then try again.")
         return
 
-    print(f"\nFound {len(drive_links)} Drive link(s):")
-    for i, link in enumerate(drive_links, start=1):
-        print(f"  {i}. {link}")
+    print(f"\nFound {len(drive_items)} Drive link(s):")
+    for i, item in enumerate(drive_items, start=1):
+        name = display_name_for_item(item)
+        print(f"  {i}. {name}")
+        if item["title"]:
+            print(f"      {item['url']}")
 
     if args.interactive:
         proceed = input("\nProcess all listed videos? (Y/n): ").strip().lower()
@@ -439,19 +523,27 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
 
     succeeded = 0
     skipped = 0
-    for i, link in enumerate(drive_links, start=1):
-        result = process_single_video(page, context, link, args, cookie_file, index=i, total=len(drive_links))
+    for i, item in enumerate(drive_items, start=1):
+        result = process_single_video(
+            page,
+            context,
+            item["url"],
+            args,
+            cookie_file,
+            index=i,
+            total=len(drive_items),
+            title=item["title"],
+        )
         if result is None:
             skipped += 1
         elif result:
             succeeded += 1
 
-    print(f"\nDone. Downloaded {succeeded}, skipped {skipped}, total {len(drive_links)}.")
+    print(f"\nDone. Downloaded {succeeded}, skipped {skipped}, total {len(drive_items)}.")
 
 
 def run_single_mode(page, context, url: str, args, cookie_file: str) -> None:
-    print(f"\nNext: {url}")
-    if prompt_skip_file(args.skip_cooldown):
+    if prompt_skip_file(args.skip_cooldown, title=url):
         return
 
     captured_urls = set()

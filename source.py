@@ -197,16 +197,25 @@ def display_name_for_item(item: DriveItem) -> str:
 
 
 def save_cookies(context, cookie_file: str) -> None:
-    browser_cookies = context.cookies()
     with open(cookie_file, "w") as f:
-        f.write("# Netscape HTTP Cookie File\n\n")
-        for c in browser_cookies:
-            domain = c["domain"]
-            host_only = "FALSE" if domain.startswith(".") else "TRUE"
-            expires = int(c.get("expires", 2147483647))
-            secure = "TRUE" if c["secure"] else "FALSE"
+        f.write("# Netscape HTTP Cookie File\n")
+        f.write("# https://curl.haxx.se/rfc/cookie_spec.html\n\n")
+        for c in context.cookies():
+            domain = c.get("domain", "")
+            if not domain:
+                continue
+            # Column 2: TRUE only when domain is prefixed with "." (subdomain cookie).
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            path = c.get("path", "/") or "/"
+            secure = "TRUE" if c.get("secure") else "FALSE"
+            expires = c.get("expires", -1)
+            expires = 0 if expires is None or expires < 0 else int(expires)
+            name, value = c.get("name", ""), c.get("value", "")
+            if "\t" in name or "\t" in value or "\n" in name or "\n" in value:
+                continue
             f.write(
-                f"{domain}\t{host_only}\t{c['path']}\t{secure}\t{expires}\t{c['name']}\t{c['value']}\n"
+                f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expires}\t"
+                f"\t{name}\t{value}\n"
             )
 
 

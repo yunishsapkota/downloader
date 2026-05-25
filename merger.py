@@ -1,6 +1,5 @@
 import os
 import subprocess
-import time
 
 
 def merge_video_audio(video_path, audio_path, output_path):
@@ -31,7 +30,6 @@ def merge_video_audio(video_path, audio_path, output_path):
 
         if result.returncode == 0:
             print(f"✅ Success! Saved as {output_path}")
-            time.sleep(5)
             # Optional: remove temp files
             for f in [video_path, audio_path]:
                 try:

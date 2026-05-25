@@ -1,13 +1,13 @@
+import argparse
 import os
 import re
-import sys
-import time
 import shutil
-import argparse
+import sys
 import threading
+import time
 from typing import List, Optional, Set, TypedDict
 
-DEFAULT_CAPTURE_WAIT = 8
+DEFAULT_CAPTURE_WAIT = 15
 POST_LOAD_DELAY = 1
 PLAY_CLICK_ATTEMPTS = 3
 PLAY_CLICK_INTERVAL = 2

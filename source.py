@@ -1,11 +1,10 @@
 import argparse
 import os
 import re
-import shutil
 import sys
 import threading
 import time
-from typing import List, Optional, Set, TypedDict
+from typing import List, Optional, Set
 
 DEFAULT_CAPTURE_WAIT = 15
 POST_LOAD_DELAY = 1
@@ -17,8 +16,9 @@ DEFAULT_OUTPUT_DIR = "downloads"
 
 from playwright.sync_api import Page, sync_playwright
 
+import cookie
 import downloader
-import merger
+import filter
 
 DRIVE_FILE_RE = re.compile(
     r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", re.IGNORECASE
@@ -28,51 +28,7 @@ DRIVE_OPEN_RE = re.compile(
 )
 
 
-class DriveItem(TypedDict):
-    url: str
-    title: str
-
-
-def strip_range_param(url: str) -> str:
-    """Remove everything from '&range=' to the end of the URL"""
-    range_start = url.find("&range=")
-    if range_start != -1:
-        return url[:range_start]
-    return url
-
-
-def parse_url_for_selection(url: str):
-    """Parse metadata for size/itag comparison"""
-    params = {}
-    query = url.split("?")[1] if "?" in url else ""
-    for param in query.split("&"):
-        if "=" in param:
-            key, value = param.split("=", 1)
-            params[key] = value
-
-    itag = params.get("itag", "")
-    clen_str = params.get("clen", "0")
-    clen = int(clen_str) if clen_str.isdigit() else 0
-    mime = params.get("mime", "").split(";")[0]
-    quality = params.get("quality", "")
-
-    return {
-        "original_url": url,
-        "itag": itag,
-        "clen": clen,
-        "mime": mime,
-        "quality": quality,
-    }
-
-
-def get_best(sources):
-    """Pick the best stream by clen → itag"""
-    if not sources:
-        return None
-    with_clen = [s for s in sources if s["clen"] > 0]
-    if with_clen:
-        return max(with_clen, key=lambda x: x["clen"])
-    return max(sources, key=lambda x: int(x["itag"]) if x["itag"].isdigit() else 0)
+DriveItem = filter.DriveItem
 
 
 def is_classroom_url(url: str) -> bool:
@@ -196,29 +152,6 @@ def display_name_for_item(item: DriveItem) -> str:
     return item["title"] or item["url"]
 
 
-def save_cookies(context, cookie_file: str) -> None:
-    with open(cookie_file, "w") as f:
-        f.write("# Netscape HTTP Cookie File\n")
-        f.write("# https://curl.haxx.se/rfc/cookie_spec.html\n\n")
-        for c in context.cookies():
-            domain = c.get("domain", "")
-            if not domain:
-                continue
-            # Column 2: TRUE only when domain is prefixed with "." (subdomain cookie).
-            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
-            path = c.get("path", "/") or "/"
-            secure = "TRUE" if c.get("secure") else "FALSE"
-            expires = c.get("expires", -1)
-            expires = 0 if expires is None or expires < 0 else int(expires)
-            name, value = c.get("name", ""), c.get("value", "")
-            if "\t" in name or "\t" in value or "\n" in name or "\n" in value:
-                continue
-            f.write(
-                f"{domain}\t{include_subdomains}\t{path}\t{secure}\t{expires}\t"
-                f"\t{name}\t{value}\n"
-            )
-
-
 def get_safe_title(page) -> str:
     page_title = page.title()
     safe_title = re.sub(r'[\\/*?:"<>|]', "", page_title)
@@ -235,9 +168,8 @@ def attach_capture_handler(page, captured_urls: Set[str]) -> None:
     def on_response(response):
         if response.status not in (200, 206):
             return
-        ct = response.headers.get("content-type", "").lower()
-        u = response.url.lower()
-        if not ("videoplayback" in u or ct.startswith(("video/", "audio/"))):
+        ct = response.headers.get("content-type", "")
+        if not filter.is_capturable_media_response(response.url, ct):
             return
         if response.url not in captured_urls:
             captured_urls.add(response.url)
@@ -337,138 +269,12 @@ def prompt_skip_file(cooldown: int = FILE_SKIP_COOLDOWN, title: Optional[str] = 
     return False
 
 
-def build_file_paths(safe_title: str, temp_dir: str, output_dir: str):
-    base = safe_title or "output"
-    video_tmp = os.path.join(temp_dir, f"{base}_video_tmp.mp4")
-    audio_tmp = os.path.join(temp_dir, f"{base}_audio_tmp.m4a")
-    output_mp4 = os.path.join(output_dir, f"{base}.mp4")
-    output_m4a = os.path.join(output_dir, f"{base}.m4a")
-    return video_tmp, audio_tmp, output_mp4, output_m4a
-
-
-def download_captured_streams(
-    captured_urls: Set[str],
-    args,
-    cookie_file: str,
-    browser_user_agent: str,
-    safe_title: str,
-) -> bool:
-    if not captured_urls:
-        print("No urls captured.")
-        return False
-
-    parsed_streams = [parse_url_for_selection(u) for u in captured_urls]
-    audio_streams = [
-        s
-        for s in parsed_streams
-        if s["mime"].startswith("audio/")
-        or (
-            s["itag"].isdigit()
-            and int(s["itag"]) in {139, 140, 141, 171, 172, 249, 250, 251}
-        )
-    ]
-    video_streams = [
-        s
-        for s in parsed_streams
-        if s["mime"].startswith("video/")
-        and not (
-            s["itag"].isdigit()
-            and int(s["itag"]) in {139, 140, 141, 171, 172, 249, 250, 251}
-        )
-    ]
-
-    best_video = get_best(video_streams)
-    best_audio = get_best(audio_streams)
-
-    clean_video_url = strip_range_param(best_video["original_url"]) if best_video else None
-    clean_audio_url = strip_range_param(best_audio["original_url"]) if best_audio else None
-
-    dl_video = False
-    dl_audio = False
-    merge_needed = False
-
-    if args.interactive:
-        print("\n--- INTERACTIVE MODE ---")
-        if best_video:
-            print(f"🎥 Video found: {best_video['itag']} ({best_video['mime']})")
-        if best_audio:
-            print(f"🔊 Audio found: {best_audio['itag']} ({best_audio['mime']})")
-
-        choice = input("\nDownload: (v)video, (a)audio, (b)both/merge [default: b]: ").lower() or "b"
-        if choice == "v" and best_video:
-            dl_video = True
-        elif choice == "a" and best_audio:
-            dl_audio = True
-        elif choice == "b":
-            dl_video = bool(best_video)
-            dl_audio = bool(best_audio)
-            merge_needed = dl_video and dl_audio
-    else:
-        dl_video = bool(best_video)
-        dl_audio = bool(best_audio)
-        merge_needed = dl_video and dl_audio
-        print(f"\n--- AUTO-DOWNLOAD MODE ({'Both' if merge_needed else 'Single Stream'}) ---")
-
-    if not dl_video and not dl_audio:
-        print("Nothing selected to download.")
-        return False
-
-    video_tmp, audio_tmp, output_mp4, output_m4a = build_file_paths(
-        safe_title, args.temp_dir, args.output_dir
-    )
-    results = [True, True]
-
-    def download_worker(idx, label, url, output_file, user_agent, cookie_path, bar_pos):
-        results[idx] = downloader.fast_download(
-            label, url, output_file, user_agent, cookie_path, bar_pos=bar_pos
-        )
-
-    threads = []
-    if dl_video:
-        threads.append(
-            threading.Thread(
-                target=download_worker,
-                args=(0, "VIDEO", clean_video_url, video_tmp, browser_user_agent, cookie_file, 0),
-            )
-        )
-    if dl_audio:
-        threads.append(
-            threading.Thread(
-                target=download_worker,
-                args=(1, "AUDIO", clean_audio_url, audio_tmp, browser_user_agent, cookie_file, 1),
-            )
-        )
-
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    print("\n" * len(threads))
-
-    if merge_needed:
-        if results[0] and results[1]:
-            merger.merge_video_audio(video_tmp, audio_tmp, output_mp4)
-            return True
-        print("Download failed, skipping merge.")
-        return False
-    if dl_video and results[0]:
-        shutil.move(video_tmp, output_mp4)
-        print(f"✅ Saved as {output_mp4}")
-        return True
-    if dl_audio and results[1]:
-        shutil.move(audio_tmp, output_m4a)
-        print(f"✅ Saved as {output_m4a}")
-        return True
-    return False
-
-
 def process_single_video(
     page,
     context,
     url: str,
     args,
-    cookie_file: str,
+    cookie_file: Optional[str],
     index=None,
     total=None,
     title: Optional[str] = None,
@@ -484,6 +290,10 @@ def process_single_video(
     print(f"{label}{display}")
     print(f"{'=' * 60}")
 
+    if filter.should_skip_before_open(display):
+        print("→ skipping (not a video — title suggests document/image)")
+        return None
+
     if prompt_skip_file(args.skip_cooldown, title=display):
         return None
 
@@ -493,18 +303,37 @@ def process_single_video(
     print(f"{label}Opening: {display}")
     page.goto(url)
 
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    time.sleep(POST_LOAD_DELAY)
+
+    if not filter.is_drive_video_page(page):
+        print("→ skipping (not a video — no video player on Drive page)")
+        return None
+
     start_video_playback(page, args.wait)
 
     browser_user_agent = page.evaluate("navigator.userAgent")
-    save_cookies(context, cookie_file)
+    if cookie_file:
+        cookie.save_cookies(context, cookie_file)
     safe_title = get_safe_title(page)
 
-    return download_captured_streams(
-        captured_urls, args, cookie_file, browser_user_agent, safe_title
+    return downloader.download_captured_streams(
+        captured_urls,
+        interactive=args.interactive,
+        temp_dir=args.temp_dir,
+        output_dir=args.output_dir,
+        cookie_file=cookie_file,
+        browser_user_agent=browser_user_agent,
+        safe_title=safe_title,
     )
 
 
-def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str) -> None:
+def run_classroom_mode(
+    page, context, classroom_url: str, args, cookie_file: Optional[str]
+) -> None:
     print(f"Launching Browser to Classroom: {classroom_url}")
     page.goto(classroom_url)
 
@@ -517,12 +346,23 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
         print("Make sure attachments are visible, then try again.")
         return
 
-    print(f"\nFound {len(drive_items)} Drive link(s):")
-    for i, item in enumerate(drive_items, start=1):
+    video_items, title_skipped = filter.filter_video_items(drive_items)
+
+    print(f"\nFound {len(drive_items)} Drive link(s), {len(video_items)} video(s):")
+    for i, item in enumerate(video_items, start=1):
         name = display_name_for_item(item)
         print(f"  {i}. {name}")
         if item["title"]:
             print(f"      {item['url']}")
+
+    if title_skipped:
+        print(f"\nSkipped {len(title_skipped)} non-video attachment(s) by title:")
+        for item in title_skipped:
+            print(f"  - {display_name_for_item(item)}")
+
+    if not video_items:
+        print("\nNo video attachments to process.")
+        return
 
     if args.interactive:
         proceed = input("\nProcess all listed videos? (Y/n): ").strip().lower()
@@ -531,8 +371,8 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
             return
 
     succeeded = 0
-    skipped = 0
-    for i, item in enumerate(drive_items, start=1):
+    skipped = len(title_skipped)
+    for i, item in enumerate(video_items, start=1):
         result = process_single_video(
             page,
             context,
@@ -540,7 +380,7 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
             args,
             cookie_file,
             index=i,
-            total=len(drive_items),
+            total=len(video_items),
             title=item["title"],
         )
         if result is None:
@@ -548,10 +388,13 @@ def run_classroom_mode(page, context, classroom_url: str, args, cookie_file: str
         elif result:
             succeeded += 1
 
-    print(f"\nDone. Downloaded {succeeded}, skipped {skipped}, total {len(drive_items)}.")
+    print(
+        f"\nDone. Downloaded {succeeded}, skipped {skipped}, "
+        f"videos {len(video_items)}, total links {len(drive_items)}."
+    )
 
 
-def run_single_mode(page, context, url: str, args, cookie_file: str) -> None:
+def run_single_mode(page, context, url: str, args, cookie_file: Optional[str]) -> None:
     if prompt_skip_file(args.skip_cooldown, title=url):
         return
 
@@ -561,14 +404,31 @@ def run_single_mode(page, context, url: str, args, cookie_file: str) -> None:
     print(f"Launching Browser to: {url}")
     page.goto(url)
 
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+    except Exception:
+        pass
+    time.sleep(POST_LOAD_DELAY)
+
+    if not filter.is_drive_video_page(page):
+        print("→ not a video file (no video player on Drive page). Exiting.")
+        return
+
     start_video_playback(page, args.wait)
 
     browser_user_agent = page.evaluate("navigator.userAgent")
-    save_cookies(context, cookie_file)
+    if cookie_file:
+        cookie.save_cookies(context, cookie_file)
     safe_title = get_safe_title(page)
 
-    download_captured_streams(
-        captured_urls, args, cookie_file, browser_user_agent, safe_title
+    downloader.download_captured_streams(
+        captured_urls,
+        interactive=args.interactive,
+        temp_dir=args.temp_dir,
+        output_dir=args.output_dir,
+        cookie_file=cookie_file,
+        browser_user_agent=browser_user_agent,
+        safe_title=safe_title,
     )
 
 
@@ -605,6 +465,12 @@ def main():
         default=DEFAULT_OUTPUT_DIR,
         help=f"Directory for finished videos (default: {DEFAULT_OUTPUT_DIR})",
     )
+    parser.add_argument(
+        "-c",
+        "--cookies",
+        action="store_true",
+        help="Export browser cookies and use them for downloads",
+    )
     args = parser.parse_args()
 
     args.temp_dir = os.path.abspath(args.temp_dir)
@@ -612,7 +478,7 @@ def main():
     os.makedirs(args.temp_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    cookie_file = os.path.join(args.temp_dir, "cookies.txt")
+    cookie_file = cookie.cookie_path(args.temp_dir) if args.cookies else None
     user_data_dir = os.path.expanduser("~/.config/google-chrome")
 
     with sync_playwright() as p:

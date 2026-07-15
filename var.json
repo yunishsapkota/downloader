@@ -1,0 +1,16 @@
+{
+  "TEMP_DIR": "tmp",
+  "OUTPUT_DIR": "downloads",
+  "CAPTURE_WAIT": 10,
+  "SKIP_COOLDOWN": 3,
+  "POST_LOAD_DELAY": 1,
+  "YTDLP_FRAGMENTS": 8,
+  "ARIA2C_CONNECTIONS": 8,
+  "ARIA2C_CHUNK_SIZE": "10M",
+  "PLAY_CLICK_ATTEMPTS": 3,
+  "PLAY_CLICK_INTERVAL": 2,
+  "CUSTOM_MODE": false,
+  "INTERACTIVE": false,
+  "USE_ARIA2C": false,
+  "USE_COOKIES": true
+}

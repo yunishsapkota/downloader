@@ -1,14 +1,15 @@
 import argparse
 import os
+
 from playwright.sync_api import sync_playwright
 
-from lib import cookie
-from lib import config
+from lib import config, cookie
 
 DEFAULT_CAPTURE_WAIT = config.get("CAPTURE_WAIT")
 FILE_SKIP_COOLDOWN = config.get("SKIP_COOLDOWN")
 DEFAULT_TEMP_DIR = config.get("TEMP_DIR")
 DEFAULT_OUTPUT_DIR = config.get("OUTPUT_DIR")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -56,7 +57,11 @@ def main():
         ),
     )
     parser.add_argument(
-        "-i", "--interactive", action="store_true", default=config.get("INTERACTIVE"), help="Ask for download options"
+        "-i",
+        "--interactive",
+        action="store_true",
+        default=config.get("INTERACTIVE"),
+        help="Ask for download options",
     )
     parser.add_argument(
         "-w",
@@ -106,15 +111,16 @@ def main():
     )
     args = parser.parse_args()
 
-    # Local import to avoid loading everything unnecessarily
-    from lib.runner import run_setup_mode, run_classroom_mode, run_classroom_ytdlp_mode, run_single_mode
+    from lib.runner import (
+        run_classroom_mode,
+        run_classroom_ytdlp_mode,
+        run_setup_mode,
+        run_single_mode,
+    )
     from lib.sanitize import is_classroom_url
 
-    # --setup does not need a URL
     if args.setup:
-        temp_dir = os.path.abspath(
-            getattr(args, "temp_dir", DEFAULT_TEMP_DIR)
-        )
+        temp_dir = os.path.abspath(getattr(args, "temp_dir", DEFAULT_TEMP_DIR))
         run_setup_mode(temp_dir)
         return
 
@@ -125,7 +131,6 @@ def main():
     os.makedirs(args.temp_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # yt-dlp mode always needs cookies for private Drive videos
     use_ytdlp = is_classroom_url(args.url) and not args.custom
     needs_cookies = args.cookies or use_ytdlp
     cookie_file = cookie.cookie_path(args.temp_dir) if needs_cookies else None
@@ -137,7 +142,6 @@ def main():
             user_data_dir=user_data_dir,
             headless=False,
             viewport={"width": 1400, "height": 900},
-            # Prevent Google from flagging the session as automated
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -145,19 +149,15 @@ def main():
             ],
         )
         page = context.pages[0] if context.pages else context.new_page()
-        # Remove the automation marker from the JS environment
         page.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
 
         if is_classroom_url(args.url):
             if args.custom:
-                # Legacy: open each video in the browser and capture raw streams
                 run_classroom_mode(page, context, args.url, args, cookie_file)
                 context.close()
             else:
-                # Default: extract links + cookies, then let yt-dlp do the work.
-                # run_classroom_ytdlp_mode closes the context itself before downloading.
                 run_classroom_ytdlp_mode(page, context, args.url, args, cookie_file)
         else:
             run_single_mode(page, context, args.url, args, cookie_file)
